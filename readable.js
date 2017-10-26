@@ -1,7 +1,7 @@
 const stream = require('stream');
 const crypto = require('crypto');
 const debug = require('debug');
-const Loader = require('@kuu/parallel-fetch');
+const fetch = require('node-fetch');
 const HLS = require('hls-parser');
 const utils = require('./utils');
 
@@ -33,9 +33,10 @@ function getUrl(url, base) {
 }
 
 class ReadStream extends stream.Readable {
-  constructor(url, options) {
-    super({objectMode: true});
-    this.loader = new Loader(options);
+  constructor(url) {
+    super({
+      objectMode: true
+    });
     this.state = STATE_NO_PLAYLIST;
     this.url = url;
     this.masterPlaylist = null;
@@ -87,7 +88,7 @@ class ReadStream extends stream.Readable {
     const variants = playlist.variants;
     let currentVariant = 0;
     this._emit('variants', variants, index => {
-      // Get feedback from the client synchronously
+			// Get feedback from the client synchronously
       currentVariant = index;
     });
     playlist.currentVariant = currentVariant;
@@ -102,7 +103,7 @@ class ReadStream extends stream.Readable {
       let currentRendition = 0;
       if (renditions.length > 0) {
         this._emit('renditions', renditions, index => {
-          // Get feedback from the client synchronously
+					// Get feedback from the client synchronously
           currentRendition = index;
         });
         variant.currentRenditions[type] = currentRendition;
@@ -180,42 +181,41 @@ class ReadStream extends stream.Readable {
 
   _loadPlaylist(url) {
     this._INCREMENT();
-    this.loader.load(url, {noCache: true}, (err, result) => {
-      this._DECREMENT();
-      if (err) {
-        return this._emit('error', err);
-      }
-      const hash = digest(result.data);
-      if (this._deferIfUnchanged(url, hash)) {
-        // The file is not changed
-        return;
-      }
-      const playlist = HLS.parse(result.data);
-      playlist.source = result.data;
-      playlist.uri = url;
-      if (playlist.isMasterPlaylist) {
-        // Master Playlist
-        this.state = STATE_MASTER_PLAYLIST_PARSED;
-        this._emitPlaylistEvent(playlist);
-        if (playlist.sessionDataList.length > 0) {
-          this._loadSessionData(playlist, () => {
-            this._emitPlaylistEvent(playlist);
-          });
+    fetch(url).then(result => {
+      result.text().then(text => {
+        this._DECREMENT();
+        const hash = digest(text);
+        if (this._deferIfUnchanged(url, hash)) {
+					// The file is not changed
+          return;
         }
-        if (playlist.sessionKeyList.length > 0) {
-          this._loadSessionKey(playlist, () => {
-            this._emitPlaylistEvent(playlist);
-          });
+        const playlist = HLS.parse(text);
+        playlist.source = text;
+        playlist.uri = url;
+        if (playlist.isMasterPlaylist) {
+					// Master Playlist
+          this.state = STATE_MASTER_PLAYLIST_PARSED;
+          this._emitPlaylistEvent(playlist);
+          if (playlist.sessionDataList.length > 0) {
+            this._loadSessionData(playlist, () => {
+              this._emitPlaylistEvent(playlist);
+            });
+          }
+          if (playlist.sessionKeyList.length > 0) {
+            this._loadSessionKey(playlist, () => {
+              this._emitPlaylistEvent(playlist);
+            });
+          }
+          this._updateMasterPlaylist(playlist);
+        } else {
+					// Media Playlist
+          this.state = STATE_MEDIA_PLAYLIST_PARSED;
+          playlist.hash = hash;
+          this._emitPlaylistEvent(playlist);
+          this._updateMediaPlaylist(playlist);
         }
-        this._updateMasterPlaylist(playlist);
-      } else {
-        // Media Playlist
-        this.state = STATE_MEDIA_PLAYLIST_PARSED;
-        playlist.hash = hash;
-        this._emitPlaylistEvent(playlist);
-        this._updateMediaPlaylist(playlist);
-      }
-    });
+      });
+    }).catch(err => this._emit('error', err));
   }
 
   _emitDataEvent(segment) {
@@ -233,25 +233,24 @@ class ReadStream extends stream.Readable {
 
   _loadSegment(playlist, segment) {
     this._INCREMENT();
-    this.loader.load(getUrl(segment.uri, playlist.uri), {readAsBuffer: true}, (err, result) => {
-      this._DECREMENT();
-      if (err) {
-        return this._emit('error', err);
-      }
-      segment.data = trimData(result.data, segment.byterange);
-      segment.mimeType = result.mimeType;
-      this._emitDataEvent(segment);
-    });
-    if (segment.key) {
-      this._loadKey(playlist, segment.key, () => {
+    fetch(getUrl(segment.uri, playlist.uri)).then(result => {
+      return result.text().then(text => {
+        this._DECREMENT();
+        segment.data = trimData(text, segment.byterange);
+        segment.mimeType = result.headers.get('content-type');
         this._emitDataEvent(segment);
+        if (segment.key) {
+          this._loadKey(playlist, segment.key, () => {
+            this._emitDataEvent(segment);
+          });
+        }
+        if (segment.map) {
+          this._loadMap(playlist, segment.map, () => {
+            this._emitDataEvent(segment);
+          });
+        }
       });
-    }
-    if (segment.map) {
-      this._loadMap(playlist, segment.map, () => {
-        this._emitDataEvent(segment);
-      });
-    }
+    }).catch(err => this._emit('error', err));
   }
 
   _loadSessionData(playlist, cb) {
@@ -261,21 +260,17 @@ class ReadStream extends stream.Readable {
         continue;
       }
       this._INCREMENT();
-      this.loader.load(getUrl(sessionData.uri, playlist.uri), (err, result) => {
-        this._DECREMENT();
-        if (err) {
-          return this._emit('error', err);
-        }
-        sessionData.data = utils.tryCatch(
-          () => {
-            return JSON.parse(result.data);
-          },
-          err => {
+      fetch(getUrl(sessionData.uri, playlist.uri)).then(result => {
+        result.text().then(text => {
+          this._DECREMENT();
+          sessionData.data = utils.tryCatch(() => {
+            return JSON.parse(text);
+          }, err => {
             print(`The session data MUST be formatted as JSON. ${err.stack}`);
-          }
-        );
-        cb();
-      });
+          });
+          cb();
+        });
+      }).catch(err => this._emit('error', err));
     }
   }
 
@@ -288,32 +283,30 @@ class ReadStream extends stream.Readable {
 
   _loadKey(playlist, key, cb) {
     this._INCREMENT();
-    this.loader.load(getUrl(key.uri, playlist.uri), {readAsBuffer: true}, (err, result) => {
-      this._DECREMENT();
-      if (err) {
-        return this._emit('error', err);
-      }
-      key.data = result.data;
-      cb();
-    });
+    fetch(getUrl(key.uri, playlist.uri)).then(result => {
+      result.text().then(text => {
+        this._DECREMENT();
+        key.data = text;
+        cb();
+      });
+    }).catch(err => this._emit('error', err));
   }
 
   _loadMap(playlist, map, cb) {
     this._INCREMENT();
-    this.loader.load(getUrl(map.uri, playlist.uri), {readAsBuffer: true}, (err, result) => {
-      this._DECREMENT();
-      if (err) {
-        return this._emit('error', err);
-      }
-      map.data = trimData(result.data, map.byterange);
-      map.mimeType = result.mimeType;
-      cb();
-    });
+    fetch(getUrl(map.uri, playlist.uri)).then(result => {
+      result.text().then(text => {
+        this._DECREMENT();
+        map.data = trimData(text, map.byterange);
+        map.mimeType = result.headers.get('content-type');
+        cb();
+      });
+    }).catch(err => this._emit('error', err));
   }
 
   _emit(...params) {
     if (params[0] === 'data') {
-      this.push(params[1]); // TODO: stop loading segments when this.push() returns false
+      this.push(params[1]);
     } else {
       this.emit(...params);
     }
